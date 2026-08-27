@@ -1,0 +1,8 @@
+{
+  "_comment": "单价表：元/百万 tokens。model 支持 * 前缀通配；匹配规则=精确优先→最长前缀。unverified=true 时页面价格列会带⚠，请到各平台控制台核实后改并去掉该标记。",
+  "updated": "2026-08-27",
+  "rows": [
+    { "provider": "bigmodel", "model": "*", "in": 2.0, "out": 8.0, "cacheRead": 1.0, "cacheWrite": 0, "unverified": true },
+    { "provider": "dashscope", "model": "*", "in": 0.8, "out": 2.0, "cacheRead": 0.2, "cacheWrite": 0, "unverified": true }
+  ]
+}

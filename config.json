@@ -1,0 +1,19 @@
+{
+  "listenHost": "127.0.0.1",
+  "port": 8386,
+  "upstreams": {
+    "bigmodel": {
+      "target": "https://open.bigmodel.cn/api/paas/v4",
+      "label": "智谱 BigModel (GLM)"
+    },
+    "dashscope": {
+      "target": "https://llm-gpy412u23kvj2c7z.cn-beijing.maas.aliyuncs.com/compatible-mode/v1",
+      "label": "阿里云 DashScope 兼容模式 (Qwen)"
+    },
+    "deepseek": {
+      "target": "https://api.deepseek.com/v1",
+      "label": "DeepSeek API"
+    }
+  },
+  "notes": "路由形态 /{tool}/{upstream}/... tool=发起方标识(pi/cc/codex/...),用于归因。"
+}

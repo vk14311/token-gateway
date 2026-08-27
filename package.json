@@ -1,0 +1,13 @@
+{
+  "name": "token-gateway",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Multi-provider LLM token metering gateway: proxies AI platforms, records per-request token usage (in/out/cache), aggregates daily cost, serves a dashboard.",
+  "type": "module",
+  "engines": { "node": ">=22.6" },
+  "scripts": {
+    "start": "node --experimental-strip-types --no-warnings src/index.ts",
+    "dev": "node --experimental-strip-types --no-warnings src/index.ts",
+    "test": "node --experimental-strip-types --no-warnings test/selftest.mts"
+  }
+}

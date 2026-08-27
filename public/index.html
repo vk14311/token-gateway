@@ -1,0 +1,148 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>token-gateway · LLM 用量与比价</title>
+<style>
+:root{
+  --bg:#0d1117;--panel:#161b22;--panel2:#1c2129;--border:#2d333b;
+  --fg:#e6edf3;--dim:#8b949e;--accent:#58a6ff;--green:#3fb950;
+  --warn:#d29922;--mono:'SF Mono',ui-monospace,Menlo,Consolas,monospace;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg);color:var(--fg);font:14px/1.5 -apple-system,'PingFang SC',sans-serif;padding:24px;max-width:1200px;margin:0 auto}
+h1{font-size:18px;font-weight:600;display:flex;align-items:center;gap:10px}
+h1 .dot{width:8px;height:8px;border-radius:50%;background:var(--green);box-shadow:0 0 6px var(--green)}
+.sub{color:var(--dim);font-size:12px;margin-top:4px}
+.win{position:absolute;top:24px;right:24px;display:flex;gap:6px}
+.win button{background:var(--panel);border:1px solid var(--border);color:var(--dim);padding:4px 10px;border-radius:6px;cursor:pointer;font-size:12px}
+.win button.on{color:var(--fg);border-color:var(--accent)}
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px;margin:20px 0}
+.card{background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:14px 16px}
+.card .k{color:var(--dim);font-size:12px}
+.card .v{font-size:22px;font-weight:600;margin-top:4px;font-family:var(--mono)}
+.card .v small{font-size:12px;color:var(--dim);font-weight:400}
+section{background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:16px;margin-bottom:16px;overflow-x:auto}
+section h2{font-size:13px;color:var(--dim);font-weight:500;margin-bottom:10px;text-transform:uppercase;letter-spacing:.5px}
+table{width:100%;border-collapse:collapse;font-family:var(--mono);font-size:12.5px;white-space:nowrap}
+th{text-align:right;color:var(--dim);font-weight:400;padding:4px 8px;border-bottom:1px solid var(--border)}
+td{text-align:right;padding:5px 8px;border-bottom:1px solid var(--panel2)}
+th:first-child,td:first-child{text-align:left}
+.model-cell{text-align:left!important}
+.bar-wrap{position:relative;display:inline-block;height:16px;width:100%;min-width:90px;vertical-align:middle}
+.bar{position:absolute;top:2px;bottom:2px;left:0;background:linear-gradient(90deg,#1f6feb88,#58a6ff44);border-radius:3px;z-index:0}
+.bar-val{position:relative;z-index:1}
+.warn-tag{color:var(--warn);cursor:help}
+.dev-ok{color:var(--green)}.dev-warn{color:var(--warn)}.dev-bad{color:#f85149}
+.bform{display:flex;gap:8px;align-items:end;margin-top:10px;flex-wrap:wrap}
+.bform label{display:flex;flex-direction:column;gap:3px;font-size:11px;color:var(--dim)}
+.bform input{background:var(--panel2);border:1px solid var(--border);color:var(--fg);border-radius:6px;padding:5px 8px;width:130px;font-family:var(--mono);font-size:12px;color-scheme:dark}
+.bform button{background:#238636;border:none;color:#fff;border-radius:6px;padding:7px 14px;cursor:pointer;font-size:12px}
+.msg{font-size:12px;margin-left:8px}
+.empty{color:var(--dim);text-align:center;padding:20px 0;font-size:13px}
+footer{color:var(--dim);font-size:11px;text-align:center;margin-top:8px}
+code{font-family:var(--mono);background:var(--panel);padding:1px 5px;border-radius:4px;border:1px solid var(--border)}
+</style>
+</head>
+<body>
+<h1><span class="dot" id="pulse"></span>token-gateway <span style="font-weight:400;color:var(--dim)">· 国产平台 LLM 用量比价</span></h1>
+<div class="sub">路由 <code>/v1/*</code> 与 <code>/{tool}/{upstream}/*</code> · 计量写入 NDJSON · 单位：tokens / 元</div>
+<div class="win" id="winbtn"></div>
+<div class="cards" id="cards"></div>
+
+<section><h2>按天</h2><div id="days"></div></section>
+<section><h2>按模型</h2><div id="models"></div></section>
+<section><h2>工具归因</h2><div id="tools"></div></section>
+<section><h2>网关估算 vs 平台账单</h2><div id="plat"></div>
+<div class="bform">
+  <label>平台<input id="bp" placeholder="bigmodel"/></label>
+  <label>日期<input id="bd" type="date"/></label>
+  <label>账单金额 ¥<input id="ba" type="number" step="0.01" placeholder="12.34"/></label>
+  <button onclick="postBill()">录入账单</button><span class="msg" id="bmsg"></span>
+</div></section>
+<footer id="gen"></footer>
+
+<script>
+'use strict';
+const fmt=n=>n==null?'—':Number(n).toLocaleString('zh-CN');
+const yuan=n=>'¥'+(Number(n)||0).toFixed(4).replace(/\.?0+$/,'');
+let cur=14;
+
+const card=(k,v,suf='')=>`<div class="card"><div class="k">${k}</div><div class="v">${v}<small>${suf}</small></div></div>`;
+
+function tab(head,rows,emptyMsg){
+  if(!rows.length)return `<div class="empty">${emptyMsg}</div>`;
+  return `<table><thead><tr>${head.map(h=>`<th>${h}</th>`).join('')}</tr></thead><tbody>${
+    rows.map(r=>'<tr>'+r.map(c=>String(c).startsWith('<td')?c:`<td>${c}</td>`).join('')+'</tr>').join('')}</tbody></table>`;
+}
+
+function modelCell(m){
+  const flag=m.unverifiedPrice?' <span class="warn-tag" title="单价未核实：请到平台控制台核对 prices.json">⚠</span>':'';
+  return `<td class="model-cell">${m.upstream}/${m.model}${flag}</td>`;
+}
+
+async function refresh(days){
+  cur=days;
+  document.querySelectorAll('.win button').forEach(b=>b.classList.toggle('on',+b.dataset.n===days));
+  let s;
+  try{s=await (await fetch(`/api/stats?days=${days}`)).json();}
+  catch(e){document.getElementById('cards').innerHTML=card('加载失败',String(e).slice(0,40));return;}
+  const today=(s.days||[]).find(d=>d.day===s.today)||{reqs:0,tokIn:0,tokOut:0,cost:0};
+  document.getElementById('cards').innerHTML=
+    card('今日请求',fmt(today.reqs))+
+    card('今日 tokens',`${fmt(today.tokIn)}<small> in / </small>${fmt(today.tokOut)}<small> out</small>`)+
+    card('今日估算成本',yuan(today.cost))+
+    card(`窗口 ${s.windowDays} 天请求`,fmt(s.totals.reqs))+
+    card('窗口估算成本',yuan(s.totals.cost))+
+    card('未计量请求',fmt(s.totals.unmetered),s.totals.unmetered?' 条 ⚠':' 条');
+
+  const maxC=Math.max(...(s.days||[]).map(d=>d.cost),1e-9);
+  document.getElementById('days').innerHTML=tab(['日期','请求','错误','入','出','缓存读','成本'],
+    (s.days||[]).map(d=>[d.day,d.reqs,
+      d.errs?`<td><span class="dev-warn">${d.errs}</span></td>`:'',
+      fmt(d.tokIn),fmt(d.tokOut),fmt(d.cacheRead),
+      `<span class="bar-wrap"><span class="bar" style="width:${Math.max(d.cost/maxC*100,2)}%"></span><span class="bar-val">${yuan(d.cost)}</span></span>`]),
+    '窗口内暂无请求记录');
+
+  document.getElementById('models').innerHTML=tab(['模型','请求','未计量','入','出','推理','缓存读','成本'],
+    (s.models||[]).map(m=>[modelCell(m),m.reqs,m.unmetered||'',fmt(m.tokIn),fmt(m.tokOut),fmt(m.reasoning),fmt(m.cacheRead),yuan(m.cost)]),
+    '暂无按模型的用量');
+
+  document.getElementById('tools').innerHTML=tab(['来源(tool)','请求','入','出','成本'],
+    (s.tools||[]).map(t=>[`<td class="model-cell">${t.tool}</td>`,t.reqs,fmt(t.tokIn),fmt(t.tokOut),yuan(t.cost)]),
+    '暂无工具归因数据');
+
+  document.getElementById('plat').innerHTML=tab(['平台','网关估算','平台账单','偏差'],
+    (s.platforms||[]).map(p=>{
+      let dev='—',cls='';
+      if(p.deviationPct!=null){dev=p.deviationPct+'%';cls=Math.abs(p.deviationPct)>50?'dev-bad':Math.abs(p.deviationPct)>10?'dev-warn':'dev-ok';}
+      return [`<td class="model-cell">${p.platform}</td>`,yuan(p.gatewayEstimate),p.billAmount?yuan(p.billAmount):'未录',
+        `<span class="${cls}">${dev}</span>`];}),
+    '录入账单后此处显示偏差（|偏差|&gt;10% 提醒核查折扣 / 赠送 / 泄漏）');
+
+  document.getElementById('gen').textContent=
+    `生成于 ${new Date(s.generatedAt).toLocaleString('zh-CN')} · 价格表${s.priceUnverified?'含 ⚠ 未核实行':''}`;
+}
+
+async function postBill(){
+  const p=document.getElementById('bp').value.trim();
+  const d=document.getElementById('bd').value;
+  const a=parseFloat(document.getElementById('ba').value);
+  try{
+    const r=await fetch('/api/bills',{method:'POST',headers:{'content-type':'application/json'},
+      body:JSON.stringify({platform:p,day:d,amountCny:a})});
+    document.getElementById('bmsg').textContent=r.ok?'✓ 已录':'✗ '+JSON.stringify(await r.json());
+  }catch(e){document.getElementById('bmsg').textContent='✗ '+e;}
+  refresh(cur);
+}
+
+(async function init(){
+  document.getElementById('winbtn').innerHTML=[7,14,30,90]
+    .map(n=>`<button data-n="${n}" onclick="refresh(${n})">${n}天</button>`).join('');
+  await refresh(14);
+  setInterval(()=>refresh(cur),30000);
+})();
+</script>
+</body>
+</html>
