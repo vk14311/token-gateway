@@ -3,6 +3,7 @@
   "updated": "2026-08-27",
   "rows": [
     { "provider": "bigmodel", "model": "*", "in": 2.0, "out": 8.0, "cacheRead": 1.0, "cacheWrite": 0, "unverified": true },
-    { "provider": "dashscope", "model": "*", "in": 0.8, "out": 2.0, "cacheRead": 0.2, "cacheWrite": 0, "unverified": true }
+    { "provider": "dashscope", "model": "*", "in": 0.8, "out": 2.0, "cacheRead": 0.2, "cacheWrite": 0, "unverified": true },
+    { "provider": "deepseek", "model": "*", "in": 1.0, "out": 2.0, "cacheRead": 0.02, "cacheWrite": 0, "unverified": true }
   ]
 }
