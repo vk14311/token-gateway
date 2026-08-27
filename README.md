@@ -59,6 +59,13 @@ launchd 常驻（macOS）：见 `deploy/com.token-gateway.plist`（`~/Library/La
 - 只落盘元信息：时间、tool/upstream/model、状态码、延迟、usage 数字、成本。**不落消息正文与 API key**。
 - `.gitignore` 排除 `data/`（真实请求数据不入库）。
 
+
+## pi footer 集成（可选）
+
+`extensions/pi-footer.ts` 拷贝到 `~/.pi/agent/extensions/` 后，pi 状态栏会出现
+`🔸TG 今日 Nreq ↑in ↓out c缓存 R推理 ¥成本` 行（全天累计，直读 NDJSON，不依赖网关进程存活；
+message_end 即时刷新 + 60s 兜底）。附 `/gw-stats`（今日+近7天弹窗）、`/gw-refresh`。
+
 ## Roadmap
 
 - [x] P1 多上游转发 + SSE usage 截获 + NDJSON 明细 + 仪表盘（GLM/DashScope 两路真机验证）
