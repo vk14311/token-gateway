@@ -1,14 +1,39 @@
 # token-gateway
 
 多上游 LLM 网关：给本机各 AI 编程工具（pi / claude-code / codex / opencode…）提供统一 base_url，
-在转发的同时**逐请求计量 token 用量并折算人民币成本**，浏览器查看聚合仪表盘。
+在转发的同时**逐请求计量 token 用量、折算人民币成本、采集性能指标**，浏览器查看聚合仪表盘。
 
 ```
-AI 工具 ──http──▶ token-gateway(127.0.0.1:8386) ──https──▶ 上游(bigmodel/dashscope/deepseek…)
+AI 工具 ──http──▶ token-gateway(127.0.0.1:8386) ──https──▶ 上游(bigmodel/dashscope/deepseek/x99…)
                      │
-                     ├─ data/YYYY-MM-DD.jsonl   逐请求明细(NDJSON 追加)
-                     └─ GET /                    仪表盘(按天/按模型/按工具/账单比对)
+                     ├─ data/YYYY-MM-DD.jsonl   逐请求明细(NDJSON 追加, 含 TTFT/流式标记)
+                     ├─ GET /api/perf           5/15/60 分钟性能窗口(tok/s、TTFT、缓存命中)
+                     ├─ GET /api/x99/metrics    x99 vLLM 服务端 Prometheus 指标代理
+                     └─ GET /                    仪表盘(用量比价 + 实时性能 + x99 服务端状态)
 ```
+
+## 性能监控（2026-08-30 增）
+
+**采集**（写入 NDJSON 逐请求记录）：
+- `stream`：响应是否 SSE；`ttftMs`：网关发出→上游首字节（仅流式，客户端体感口径）
+
+**网关侧窗口聚合**（`/api/perf?minutes=5|15|60`）：
+- TTFT avg/p50/p90；decode tok/s（加权 = ΣtokOut/Σdecode 期，请求级中位数双口径）
+- 缓存命中率 = ΣcacheRead/ΣtokIn；错误率；req/min；平均入/出上下文规模
+- 注：tok/s 仅统计 decode 期>50ms 的流式请求（TTFT 不算 decode）
+
+**x99 vLLM 服务端面板**（`/api/x99/metrics`，4s 超时保护）：
+- 运行/排队请求数、KV 池占用、prefix 缓存命中率（次数级+token 级）
+- 投机接受率（DFlash2 draft 被采纳比例，方案 B 特有；方案 A 为 null）
+- 服务端 TTFT/ITL/e2e/prefill/decode 累计均值、preemptions（>0 = KV 池出现过抢占）
+- 上游登记 `config.json` 的 `upstreams.*.metricsUrl` 即可获得同款面板（当前仅 x99）
+
+**GPU 硬件探针**（`/api/x99/hardware`，2026-08-30 增）：
+- 上游登记 `"hardware": {"sshHost": "x99"}` 后，网关经 ssh 在 GPU 主机上跑 nvidia-smi（BatchMode 免密），采集双卡温度/SM 频率/功耗/风扇/显存/利用率 + 降频原因（SW 功率墙 / SW·HW 热降频）
+- 15s TTL 缓存 + 6s 超时；页面温度 ≥85°C 标红、有降频原因时红字警示
+- 引擎挂死判别：`generationTokensTotal` 连续两次采样不增长 + running≥1
+
+仪表盘每 30s 自动刷新；性能窗口与天窗口独立切换。
 
 ## 路由形态
 

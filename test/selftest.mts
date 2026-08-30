@@ -32,10 +32,11 @@ const up = httpServer((req, res) => {
 
 		if (body.stream) {
 			res.writeHead(200, { "content-type": "text/event-stream" });
-			const frames = [
-				`data: ${JSON.stringify({ model: body.model, choices: [{ delta: { role: "assistant" } }] })}\n\n`,
-				`data: ${JSON.stringify({ choices: [{ delta: { content: "hi" } }] })}\n\n`,
-				`data: ${JSON.stringify({
+			res.write(`data: ${JSON.stringify({ model: body.model, choices: [{ delta: { role: "assistant" } }] })}\n\n`);
+			// gap between first frame and the rest so decode window > 50ms (measurable tok/s)
+			setTimeout(() => {
+				res.write(`data: ${JSON.stringify({ choices: [{ delta: { content: "hi" } }] })}\n\n`);
+				res.write(`data: ${JSON.stringify({
 					choices: [],
 					usage: {
 						prompt_tokens: 120,
@@ -43,11 +44,10 @@ const up = httpServer((req, res) => {
 						prompt_tokens_details: { cached_tokens: 100 },
 						completion_tokens_details: { reasoning_tokens: 20 },
 					},
-				})}\n\n`,
-				"data: [DONE]\n\n",
-			];
-			for (const f of frames) res.write(f);
-			res.end();
+				})}\n\n`);
+				res.write("data: [DONE]\n\n");
+				res.end();
+			}, 150);
 		} else {
 			res.writeHead(200, { "content-type": "application/json" });
 			res.end(
@@ -101,6 +101,7 @@ console.log("selftest:");
 	ok("stream: cache_read + reasoning captured", mine[0].usage?.cacheRead === 100 && mine[0].usage?.reasoning === 20);
 	ok("stream: tool attributed from path", mine[0].tool === "pi");
 	ok("stream: injectedUsageOpt flagged", mine[0].injectedUsageOpt === true);
+	ok("stream: stream=true + ttftMs captured", mine[0].stream === true && typeof mine[0].ttftMs === "number" && mine[0].ttftMs >= 0);
 }
 
 // 2) non-streaming request
@@ -115,9 +116,23 @@ console.log("selftest:");
 	await new Promise((r) => setTimeout(r, 60));
 	const recs = readDay(new Date().toLocaleDateString("en-CA", { timeZone: "Asia/Shanghai" })).filter((r) => r.tool === "cc");
 	ok("nonstream: usage recorded", recs.length === 1 && recs[0].usage?.tokIn === 50 && recs[0].usage?.tokOut === 10);
+	ok("nonstream: stream=false + ttftMs null", recs[0].stream === false && recs[0].ttftMs === null);
 }
 
-// 3) stats endpoint aggregates both
+// 3) perf endpoint aggregates both
+{
+	const res = await call("/api/perf?minutes=60");
+	const perf = await res.json();
+	ok("perf: window minutes echoed", perf.minutes === 60);
+	ok("perf: rows have both upstreams' models", perf.rows.length === 2);
+	const piRow = perf.rows.find((r: any) => r.model === "glm-4.7-flash");
+	ok("perf: streaming row has ttft + tps", piRow && piRow.ttftAvgMs != null && piRow.tpsWeighted != null && piRow.tpsN === 1);
+	ok("perf: cache hit pct computed", piRow && piRow.cacheHitPct != null && Math.abs(piRow.cacheHitPct - 83.3) < 0.1);
+	const ccRow = perf.rows.find((r: any) => r.model === "qwen3.8-flash");
+	ok("perf: non-stream row has no ttft/tps", ccRow && ccRow.ttftAvgMs === null && ccRow.tpsWeighted === null);
+}
+
+// 4) stats endpoint aggregates both
 {
 	const res = await call("/api/stats?days=7");
 	const stats = await res.json();
@@ -127,7 +142,7 @@ console.log("selftest:");
 	ok("stats: platform bill section present", Array.isArray(stats.platforms));
 }
 
-// 4) unknown upstream -> 404; malformed route -> 400
+// 5) unknown upstream -> 404; malformed route -> 400
 {
 	ok("unknown upstream 404", (await call("/pi/nope/chat/completions", { method: "POST" })).status === 404);
 	ok("single segment 404", (await call("/onlyonesegment")).status === 404);

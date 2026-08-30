@@ -5,6 +5,10 @@ export interface UpstreamDef {
 	label?: string;
 	/** Optional fixed key from gateway .env; when absent the client's Authorization is forwarded verbatim. */
 	key?: string;
+	/** Optional Prometheus /metrics endpoint for the live server-status panel (e.g. local vLLM). */
+	metricsUrl?: string;
+	/** Optional GPU-host hardware probe: ssh to this ssh-config alias and run nvidia-smi there. */
+	hardware?: { sshHost: string };
 }
 
 export interface AppConfig {
@@ -36,6 +40,8 @@ export interface RequestRecord {
 	costCny: number | null;
 	error?: string; // non-2xx snippet or upstream failure note
 	injectedUsageOpt?: boolean; // we added stream_options.include_usage to the outbound body
+	stream?: boolean; // response was SSE
+	ttftMs?: number | null; // streaming: gateway→first upstream byte; null for non-stream
 }
 
 export interface PriceRow {

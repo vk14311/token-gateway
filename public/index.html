@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1"/>
-<title>token-gateway · LLM 用量与比价</title>
+<title>token-gateway · LLM 用量与性能监控</title>
 <style>
 :root{
   --bg:#0d1117;--panel:#161b22;--panel2:#1c2129;--border:#2d333b;
@@ -11,20 +11,21 @@
   --warn:#d29922;--mono:'SF Mono',ui-monospace,Menlo,Consolas,monospace;
 }
 *{box-sizing:border-box;margin:0;padding:0}
-body{background:var(--bg);color:var(--fg);font:14px/1.5 -apple-system,'PingFang SC',sans-serif;padding:24px;max-width:1200px;margin:0 auto}
+body{background:var(--bg);color:var(--fg);font:14px/1.5 -apple-system,'PingFang SC',sans-serif;padding:24px;max-width:1280px;margin:0 auto}
 h1{font-size:18px;font-weight:600;display:flex;align-items:center;gap:10px}
 h1 .dot{width:8px;height:8px;border-radius:50%;background:var(--green);box-shadow:0 0 6px var(--green)}
 .sub{color:var(--dim);font-size:12px;margin-top:4px}
 .win{position:absolute;top:24px;right:24px;display:flex;gap:6px}
-.win button{background:var(--panel);border:1px solid var(--border);color:var(--dim);padding:4px 10px;border-radius:6px;cursor:pointer;font-size:12px}
-.win button.on{color:var(--fg);border-color:var(--accent)}
+.win button,.perfbar button{background:var(--panel);border:1px solid var(--border);color:var(--dim);padding:4px 10px;border-radius:6px;cursor:pointer;font-size:12px}
+.win button.on,.perfbar button.on{color:var(--fg);border-color:var(--accent)}
 .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px;margin:20px 0}
 .card{background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:14px 16px}
 .card .k{color:var(--dim);font-size:12px}
 .card .v{font-size:22px;font-weight:600;margin-top:4px;font-family:var(--mono)}
 .card .v small{font-size:12px;color:var(--dim);font-weight:400}
 section{background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:16px;margin-bottom:16px;overflow-x:auto}
-section h2{font-size:13px;color:var(--dim);font-weight:500;margin-bottom:10px;text-transform:uppercase;letter-spacing:.5px}
+section h2{font-size:13px;color:var(--dim);font-weight:500;margin-bottom:10px;text-transform:uppercase;letter-spacing:.5px;display:flex;align-items:center;gap:12px}
+.perfbar{margin-left:auto;display:flex;gap:6px;text-transform:none;letter-spacing:0}
 table{width:100%;border-collapse:collapse;font-family:var(--mono);font-size:12.5px;white-space:nowrap}
 th{text-align:right;color:var(--dim);font-weight:400;padding:4px 8px;border-bottom:1px solid var(--border)}
 td{text-align:right;padding:5px 8px;border-bottom:1px solid var(--panel2)}
@@ -43,13 +44,25 @@ th:first-child,td:first-child{text-align:left}
 .empty{color:var(--dim);text-align:center;padding:20px 0;font-size:13px}
 footer{color:var(--dim);font-size:11px;text-align:center;margin-top:8px}
 code{font-family:var(--mono);background:var(--panel);padding:1px 5px;border-radius:4px;border:1px solid var(--border)}
+.svc-dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px}
+.note{color:var(--dim);font-size:11.5px;margin-top:8px}
 </style>
 </head>
 <body>
-<h1><span class="dot" id="pulse"></span>token-gateway <span style="font-weight:400;color:var(--dim)">· 国产平台 LLM 用量比价</span></h1>
-<div class="sub">路由 <code>/v1/*</code> 与 <code>/{tool}/{upstream}/*</code> · 计量写入 NDJSON · 单位：tokens / 元</div>
+<h1><span class="dot" id="pulse"></span>token-gateway <span style="font-weight:400;color:var(--dim)">· LLM 用量与性能监控</span></h1>
+<div class="sub">路由 <code>/{tool}/{upstream}/*</code> · 计量+性能写入 NDJSON · 单位：tokens / 元 / ms / tok·s⁻¹</div>
 <div class="win" id="winbtn"></div>
 <div class="cards" id="cards"></div>
+
+<section><h2>实时性能 <span class="perfbar" id="perfwin"></span></h2><div id="perf"></div>
+<div class="note">TTFT 与 tok/s 仅统计流式请求（客户端体感口径：网关发出→上游首字节 / 首字节后→最后字节）；缓存命中率 = Σ缓存读 / Σ输入 tokens；口径注：decode 期不含 TTFT，短请求（decode&lt;50ms）不计入 tok/s。</div>
+</section>
+
+<section id="x99sec" style="display:none"><h2 id="x99title">x99 vLLM 服务端状态</h2>
+<div class="cards" id="x99cards"></div>
+<div id="hwwrap" style="margin-top:12px"></div>
+<div class="note" id="x99note"></div>
+</section>
 
 <section><h2>按天</h2><div id="days"></div></section>
 <section><h2>按模型</h2><div id="models"></div></section>
@@ -67,7 +80,10 @@ code{font-family:var(--mono);background:var(--panel);padding:1px 5px;border-radi
 'use strict';
 const fmt=n=>n==null?'—':Number(n).toLocaleString('zh-CN');
 const yuan=n=>'¥'+(Number(n)||0).toFixed(4).replace(/\.?0+$/,'');
-let cur=14;
+const pct=(a,b)=>b>0?(a/b*100).toFixed(1)+'%':'—';
+const ms=v=>v==null?'—':(v>=1000?(v/1000).toFixed(2)+'s':Math.round(v)+'ms');
+const tps=v=>v==null?'—':(v>=100?v.toFixed(0):v.toFixed(1));
+let cur=14, perfMin=5;
 
 const card=(k,v,suf='')=>`<div class="card"><div class="k">${k}</div><div class="v">${v}<small>${suf}</small></div></div>`;
 
@@ -82,31 +98,34 @@ function modelCell(m){
   return `<td class="model-cell">${m.upstream}/${m.model}${flag}</td>`;
 }
 
-async function refresh(days){
+async function refreshStats(days){
   cur=days;
   document.querySelectorAll('.win button').forEach(b=>b.classList.toggle('on',+b.dataset.n===days));
   let s;
   try{s=await (await fetch(`/api/stats?days=${days}`)).json();}
   catch(e){document.getElementById('cards').innerHTML=card('加载失败',String(e).slice(0,40));return;}
-  const today=(s.days||[]).find(d=>d.day===s.today)||{reqs:0,tokIn:0,tokOut:0,cost:0};
+  const today=(s.days||[]).find(d=>d.day===s.today)||{reqs:0,tokIn:0,tokOut:0,cacheRead:0,cost:0};
+  const todayTotal=today.tokIn+today.tokOut;
   document.getElementById('cards').innerHTML=
     card('今日请求',fmt(today.reqs))+
     card('今日 tokens',`${fmt(today.tokIn)}<small> in / </small>${fmt(today.tokOut)}<small> out</small>`)+
+    card('今日总 tokens',fmt(todayTotal))+
+    card('今日缓存读占比',pct(today.cacheRead,today.tokIn))+
     card('今日估算成本',yuan(today.cost))+
     card(`窗口 ${s.windowDays} 天请求`,fmt(s.totals.reqs))+
     card('窗口估算成本',yuan(s.totals.cost))+
     card('未计量请求',fmt(s.totals.unmetered),s.totals.unmetered?' 条 ⚠':' 条');
 
   const maxC=Math.max(...(s.days||[]).map(d=>d.cost),1e-9);
-  document.getElementById('days').innerHTML=tab(['日期','请求','错误','入','出','缓存读','成本'],
+  document.getElementById('days').innerHTML=tab(['日期','请求','错误','入','出','总','输出%','缓存读','缓存读%','成本'],
     (s.days||[]).map(d=>[d.day,d.reqs,
       d.errs?`<td><span class="dev-warn">${d.errs}</span></td>`:'',
-      fmt(d.tokIn),fmt(d.tokOut),fmt(d.cacheRead),
+      fmt(d.tokIn),fmt(d.tokOut),fmt(d.tokIn+d.tokOut),pct(d.tokOut,d.tokIn+d.tokOut),fmt(d.cacheRead),pct(d.cacheRead,d.tokIn),
       `<span class="bar-wrap"><span class="bar" style="width:${Math.max(d.cost/maxC*100,2)}%"></span><span class="bar-val">${yuan(d.cost)}</span></span>`]),
     '窗口内暂无请求记录');
 
-  document.getElementById('models').innerHTML=tab(['模型','请求','未计量','入','出','推理','缓存读','成本'],
-    (s.models||[]).map(m=>[modelCell(m),m.reqs,m.unmetered||'',fmt(m.tokIn),fmt(m.tokOut),fmt(m.reasoning),fmt(m.cacheRead),yuan(m.cost)]),
+  document.getElementById('models').innerHTML=tab(['模型','请求','未计量','入','出','总','输出%','推理','缓存读','缓存读%','成本'],
+    (s.models||[]).map(m=>[modelCell(m),m.reqs,m.unmetered||'',fmt(m.tokIn),fmt(m.tokOut),fmt(m.tokIn+m.tokOut),pct(m.tokOut,m.tokIn+m.tokOut),fmt(m.reasoning),fmt(m.cacheRead),pct(m.cacheRead,m.tokIn),yuan(m.cost)]),
     '暂无按模型的用量');
 
   document.getElementById('tools').innerHTML=tab(['来源(tool)','请求','入','出','成本'],
@@ -125,6 +144,97 @@ async function refresh(days){
     `生成于 ${new Date(s.generatedAt).toLocaleString('zh-CN')} · 价格表${s.priceUnverified?'含 ⚠ 未核实行':''}`;
 }
 
+async function refreshPerf(minutes){
+  perfMin=minutes;
+  document.querySelectorAll('.perfbar button').forEach(b=>b.classList.toggle('on',+b.dataset.n===minutes));
+  let p;
+  try{p=await (await fetch(`/api/perf?minutes=${minutes}`)).json();}
+  catch(e){document.getElementById('perf').innerHTML=`<div class="empty">性能数据加载失败 ${String(e).slice(0,40)}</div>`;return;}
+  if(!p.rows||!p.rows.length){
+    document.getElementById('perf').innerHTML=`<div class="empty">最近 ${p.minutes} 分钟内无请求（发一条消息后再看）</div>`;
+    return;
+  }
+  document.getElementById('perf').innerHTML=tab(
+    ['上游/模型','请求','req/min','错误率','流式','TTFT avg','TTFT p50','TTFT p90','tok/s 加权','tok/s 中位','缓存命中','平均入','平均出','最近请求'],
+    p.rows.map(r=>{
+      const errCls=r.errs?(r.errs/r.reqs>0.1?'dev-bad':'dev-warn'):'dev-ok';
+      const chCls=r.cacheHitPct==null?'':r.cacheHitPct>=50?'dev-ok':r.cacheHitPct>=10?'dev-warn':'dev-bad';
+      return [`<td class="model-cell">${r.upstream}/${r.model}</td>`,r.reqs,r.reqPerMin,
+        `<span class="${errCls}">${r.reqs?((r.errs/r.reqs*100).toFixed(0)+'%'):'0%'}</span>`,
+        r.streamReqs,ms(r.ttftAvgMs),ms(r.ttftP50Ms),ms(r.ttftP90Ms),
+        `<b>${tps(r.tpsWeighted)}</b>`,tps(r.tpsMedian),
+        `<span class="${chCls}">${r.cacheHitPct==null?'—':r.cacheHitPct+'%'}</span>`,
+        fmt(r.avgTokIn),fmt(r.avgTokOut),
+        r.lastTs?new Date(r.lastTs).toLocaleTimeString('zh-CN'):'—'];
+    }),
+    '');
+}
+
+async function refreshX99(){
+  let m,hw;
+  try{[m,hw]=await Promise.all([
+    (async()=>{try{return await (await fetch('/api/x99/metrics')).json();}catch(e){return {ok:false,reason:String(e).slice(0,60)};}})(),
+    (async()=>{try{return await (await fetch('/api/x99/hardware')).json();}catch(e){return {ok:false,reason:String(e).slice(0,60)};}})(),
+  ]);}
+  catch(e){m={ok:false,reason:String(e).slice(0,60)};}
+  const sec=document.getElementById('x99sec');
+  if(!m||!m.ok){
+    sec.style.display='block';
+    document.getElementById('x99title').innerHTML='<span class="svc-dot" style="background:#f85149"></span>x99 vLLM 服务端状态';
+    document.getElementById('x99cards').innerHTML=card('服务离线','—',m&&m.reason?` ${m.reason.slice(0,60)}`:'');
+    document.getElementById('hwwrap').innerHTML='';
+    return;
+  }
+  const d=m.data;
+  sec.style.display='block';
+  document.getElementById('x99title').innerHTML=
+    `<span class="svc-dot" style="background:var(--green);box-shadow:0 0 6px var(--green)"></span>x99 vLLM 服务端状态 · ${d.model||'?'}`;
+  const acc=d.specAcceptPct==null?'<small>未开投机</small>':d.specAcceptPct+'%'+(d.specPerDraft!=null?`<small> 每次≈${d.specPerDraft}t</small>`:'');
+  const tput=d.avgGenTokens&&d.itlAvgMs?`${tps(d.avgGenTokens/d.itlAvgMs*1000)}`:null;
+  document.getElementById('x99cards').innerHTML=
+    card('运行中 / 排队',`${fmt(d.numRunning)}<small> / </small>${fmt(d.numWaiting)}`)+
+    card('KV 池占用',d.kvCacheUsedTokens!=null&&d.kvCacheTotalTokens?`${fmt(d.kvCacheUsedTokens)} / ${fmt(d.kvCacheTotalTokens)} token`:(d.kvCacheUsagePct==null?'—':d.kvCacheUsagePct+'%'),d.kvCacheUsagePct!=null?d.kvCacheUsagePct+'%':'')+
+    card('prefix 缓存命中',d.prefixCacheHitPct==null?'—':d.prefixCacheHitPct+'%','（次数）')+
+    card('缓存 token 占比',d.promptCacheHitPct==null?'—':d.promptCacheHitPct+'%','（tokens）')+
+    card('投机接受率',acc,d.specAcceptPct==null?'':` ${fmt(d.specDraftTokens)}<small> draft</small>`)+
+    card('单请求解码速度',tput?tps(tput):'—','tok/s（=平均生成长度 ÷ ITL，近似单流上限）')+
+    card('e2e 延迟均值',ms(d.e2eAvgMs))+
+    card('累计 tokens',`${fmt(d.promptTokensTotal)}<small> p / </small>${fmt(d.generationTokensTotal)}<small> g</small>`,` 均 ${fmt(d.avgPromptTokens)}/${fmt(d.avgGenTokens)}`)+
+    card('preemptions',fmt(d.preemptionsTotal),d.preemptionsTotal>0?' ⚠':'')+
+    card('成功请求',fmt(d.successTotal));
+
+  // GPU 硬件行
+  const hwEl=document.getElementById('hwwrap');
+  if(hw&&hw.ok&&Array.isArray(hw.gpus)&&hw.gpus.length){
+    const TH=85; // 热风险阈值(°C)，风道决定的高温带
+    hwEl.innerHTML=tab(['GPU','温度','SM 频率','功耗','风扇','显存','利用率','降频状态'],
+      hw.gpus.map(g=>{
+        const hot=g.tempC>=TH;
+        const thr=g.throttleActive&&g.throttleActive.length
+          ?`<span class="dev-bad">⚠ ${g.throttleActive.join(' + ')}</span>`
+          :'<span class="dev-ok">正常</span>';
+        const memPct=g.memTotalMiB?Math.round(g.memUsedMiB/g.memTotalMiB*100):null;
+        return [`<td class="model-cell">GPU${g.index}${hot?' <span class="dev-warn">热</span>':''}</td>`,
+          `<span class="${hot?'dev-bad':''}">${g.tempC}°C</span>`,
+          `${fmt(g.smMHz)}<small> MHz</small>`,
+          `${g.powerW.toFixed(0)}<small> W</small>`,
+          `${g.fanPct}%`,
+          `${fmt(g.memUsedMiB)}<small>/</small>${fmt(g.memTotalMiB)}<small> MiB (${memPct}%)</small>`,
+          `${g.utilPct}%`,
+          thr];
+      }));
+  }else{
+    hwEl.innerHTML=`<div class="empty" style="padding:8px 0">硬件探针不可用${hw&&hw.reason?'：'+hw.reason.slice(0,70):''}</div>`;
+  }
+
+  document.getElementById('x99note').textContent=
+    `口径：服务端 Prometheus 累计均值（自进程启动起），与上方网关侧“窗口体感”互补。TTFT 含 prefill；ITL≈每 token 间隔；单请求解码速度=平均生成长度÷ITL（近似单流上限，vLLM 无实时吞吐 gauge，该值不随空闲回落）；投机接受率=draft 被采纳比例，每次≈N 表示每次 draft 平均采纳 token 数（DFlash2 n=7，方案 B 才有）；preemptions>0 表示 KV 池出现过抢占。硬件经 ssh nvidia-smi 采样（15s 缓存），温度 ≥85°C 标红，GPU1 锁频 1500MHz 为既定散热口径（0x20 热降频史见 ai-docs）。采样于 ${new Date(d.generatedAt).toLocaleTimeString('zh-CN')}。`;
+}
+
+async function refresh(days){
+  await Promise.all([refreshStats(days),refreshPerf(perfMin),refreshX99()]);
+}
+
 async function postBill(){
   const p=document.getElementById('bp').value.trim();
   const d=document.getElementById('bd').value;
@@ -134,12 +244,14 @@ async function postBill(){
       body:JSON.stringify({platform:p,day:d,amountCny:a})});
     document.getElementById('bmsg').textContent=r.ok?'✓ 已录':'✗ '+JSON.stringify(await r.json());
   }catch(e){document.getElementById('bmsg').textContent='✗ '+e;}
-  refresh(cur);
+  refreshStats(cur);
 }
 
 (async function init(){
   document.getElementById('winbtn').innerHTML=[7,14,30,90]
-    .map(n=>`<button data-n="${n}" onclick="refresh(${n})">${n}天</button>`).join('');
+    .map(n=>`<button data-n="${n}" onclick="refreshStats(${n})">${n}天</button>`).join('');
+  document.getElementById('perfwin').innerHTML=[5,15,60]
+    .map(n=>`<button data-n="${n}" onclick="refreshPerf(${n})">${n}分钟</button>`).join('');
   await refresh(14);
   setInterval(()=>refresh(cur),30000);
 })();

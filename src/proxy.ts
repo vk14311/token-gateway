@@ -47,6 +47,8 @@ interface FinishArgs {
 	scan: SseScanResult | null;
 	injectedUsageOpt: boolean;
 	errorNote?: string;
+	stream?: boolean;
+	ttftMs?: number | null;
 }
 
 export function makeProxyHandler(cfg: AppConfig) {
@@ -78,6 +80,8 @@ export function makeProxyHandler(cfg: AppConfig) {
 			costCny,
 			error: args.status >= 400 || args.errorNote ? (args.errorNote ?? `HTTP ${args.status}`).slice(0, 300) : undefined,
 			injectedUsageOpt: args.injectedUsageOpt || undefined,
+			stream: args.stream,
+			ttftMs: args.ttftMs,
 		});
 	}
 
@@ -165,6 +169,7 @@ export function makeProxyHandler(cfg: AppConfig) {
 			const scanner = new SseScanner();
 			const decoder = new TextDecoder("utf-8");
 			let done = false;
+			let firstChunkAt: number | null = null;
 			const onDone = () => {
 				if (done) return;
 				done = true;
@@ -172,12 +177,13 @@ export function makeProxyHandler(cfg: AppConfig) {
 				finish({
 					tool, upstream: upName, model: scanner.result.model ?? reqModel, restPath,
 					method: req.method, startedAt, status: upRes.status,
-					scan: scanner.result, injectedUsageOpt,
+					scan: scanner.result, injectedUsageOpt, stream: true, ttftMs: firstChunkAt == null ? null : firstChunkAt - startedAt,
 				});
 			};
 			const meteringStream = upRes.body.pipeThrough(
 				new TransformStream<Uint8Array, Uint8Array>({
 					transform(chunk, ctrl) {
+						if (firstChunkAt == null) firstChunkAt = Date.now();
 						scanner.push(decoder.decode(chunk, { stream: true }));
 						ctrl.enqueue(chunk);
 					},
@@ -197,6 +203,7 @@ export function makeProxyHandler(cfg: AppConfig) {
 						tool, upstream: upName, model: scanner.result.model ?? reqModel, restPath,
 						method: req.method, startedAt, status: upRes.status,
 						scan: scanner.end(), injectedUsageOpt, errorNote: `relay: ${e}`.slice(0, 300),
+						stream: true, ttftMs: firstChunkAt == null ? null : firstChunkAt - startedAt,
 					});
 				});
 			return new Response(toClient, { status: upRes.status, headers: resHeaders });
@@ -215,7 +222,7 @@ export function makeProxyHandler(cfg: AppConfig) {
 			tool, upstream: upName, model: respModel ?? reqModel, restPath,
 			method: req.method, startedAt, status: upRes.status,
 			scan: usage ? { usage, model: respModel, sawDone: false, frames: 1 } : null,
-			injectedUsageOpt,
+			injectedUsageOpt, stream: false, ttftMs: null,
 		});
 		return new Response(text, { status: upRes.status, headers: resHeaders });
 	};
