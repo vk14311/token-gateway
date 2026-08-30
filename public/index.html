@@ -190,14 +190,14 @@ async function refreshX99(){
   document.getElementById('x99title').innerHTML=
     `<span class="svc-dot" style="background:var(--green);box-shadow:0 0 6px var(--green)"></span>x99 vLLM 服务端状态 · ${d.model||'?'}`;
   const acc=d.specAcceptPct==null?'<small>未开投机</small>':d.specAcceptPct+'%'+(d.specPerDraft!=null?`<small> 每次≈${d.specPerDraft}t</small>`:'');
-  const tput=d.avgGenTokens&&d.itlAvgMs?d.avgGenTokens/(d.itlAvgMs/1000):null;
+  const tput=d.itlAvgMs?(1000/d.itlAvgMs):null;
   document.getElementById('x99cards').innerHTML=
     card('运行中 / 排队',`${fmt(d.numRunning)}<small> / </small>${fmt(d.numWaiting)}`)+
     card('KV 池占用',d.kvCacheUsedTokens!=null&&d.kvCacheTotalTokens?`${fmt(d.kvCacheUsedTokens)} / ${fmt(d.kvCacheTotalTokens)} token`:(d.kvCacheUsagePct==null?'—':d.kvCacheUsagePct+'%'),d.kvCacheUsagePct!=null?d.kvCacheUsagePct+'%':'')+
     card('prefix 缓存命中',d.prefixCacheHitPct==null?'—':d.prefixCacheHitPct+'%','（次数）')+
     card('缓存 token 占比',d.promptCacheHitPct==null?'—':d.promptCacheHitPct+'%','（tokens）')+
     card('投机接受率',acc,d.specAcceptPct==null?'':` ${fmt(d.specDraftTokens)}<small> draft</small>`)+
-    card('单请求解码速度',tput?tps(tput):'—','tok/s（=平均生成长度 ÷ ITL，近似单流上限）')+
+    card('单请求解码速度',tput!=null?tps(tput):'—','tok/s（=1/ITL，token 间隔倒数，近似单流解码上限）')+
     card('e2e 延迟均值',ms(d.e2eAvgMs))+
     card('累计 tokens',`${fmt(d.promptTokensTotal)}<small> p / </small>${fmt(d.generationTokensTotal)}<small> g</small>`,` 均 ${fmt(d.avgPromptTokens)}/${fmt(d.avgGenTokens)}`)+
     card('preemptions',fmt(d.preemptionsTotal),d.preemptionsTotal>0?' ⚠':'')+
@@ -228,7 +228,7 @@ async function refreshX99(){
   }
 
   document.getElementById('x99note').textContent=
-    `口径：服务端 Prometheus 累计均值（自进程启动起），与上方网关侧“窗口体感”互补。TTFT 含 prefill；ITL≈每 token 间隔；单请求解码速度=平均生成长度÷ITL（近似单流上限，vLLM 无实时吞吐 gauge，该值不随空闲回落）；投机接受率=draft 被采纳比例，每次≈N 表示每次 draft 平均采纳 token 数（DFlash2 n=7，方案 B 才有）；preemptions>0 表示 KV 池出现过抢占。硬件经 ssh nvidia-smi 采样（15s 缓存），温度 ≥85°C 标红，GPU1 锁频 1500MHz 为既定散热口径（0x20 热降频史见 ai-docs）。采样于 ${new Date(d.generatedAt).toLocaleTimeString('zh-CN')}。`;
+    `口径：服务端 Prometheus 累计均值（自进程启动起），与上方网关侧“窗口体感”互补。TTFT 含 prefill；ITL≈每 token 间隔（含 prefill/调度间隙，故偏大）；单请求解码速度=1/ITL（token 间隔倒数，近似单流解码上限，vLLM 无实时吞吐 gauge，该值不随空闲回落）；投机接受率=draft 被采纳比例，每次≈N 表示每次 draft 平均采纳 token 数（DFlash2 n=7，方案 B 才有）；preemptions>0 表示 KV 池出现过抢占。硬件经 ssh nvidia-smi 采样（15s 缓存），温度 ≥85°C 标红，GPU1 锁频 1500MHz 为既定散热口径（0x20 热降频史见 ai-docs）。采样于 ${new Date(d.generatedAt).toLocaleTimeString('zh-CN')}。`;
 }
 
 async function refresh(days){
