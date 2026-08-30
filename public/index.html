@@ -190,7 +190,7 @@ async function refreshX99(){
   document.getElementById('x99title').innerHTML=
     `<span class="svc-dot" style="background:var(--green);box-shadow:0 0 6px var(--green)"></span>x99 vLLM 服务端状态 · ${d.model||'?'}`;
   const acc=d.specAcceptPct==null?'<small>未开投机</small>':d.specAcceptPct+'%'+(d.specPerDraft!=null?`<small> 每次≈${d.specPerDraft}t</small>`:'');
-  const tput=d.avgGenTokens&&d.itlAvgMs?`${tps(d.avgGenTokens/d.itlAvgMs*1000)}`:null;
+  const tput=d.avgGenTokens&&d.itlAvgMs?d.avgGenTokens/(d.itlAvgMs/1000):null;
   document.getElementById('x99cards').innerHTML=
     card('运行中 / 排队',`${fmt(d.numRunning)}<small> / </small>${fmt(d.numWaiting)}`)+
     card('KV 池占用',d.kvCacheUsedTokens!=null&&d.kvCacheTotalTokens?`${fmt(d.kvCacheUsedTokens)} / ${fmt(d.kvCacheTotalTokens)} token`:(d.kvCacheUsagePct==null?'—':d.kvCacheUsagePct+'%'),d.kvCacheUsagePct!=null?d.kvCacheUsagePct+'%':'')+
