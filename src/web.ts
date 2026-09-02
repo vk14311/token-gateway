@@ -4,6 +4,8 @@
  *   GET  /api/stats?days=N -> daily/model/tool aggregates (+ per-platform bill compare)
  *   GET  /api/perf?minutes=N  -> per-upstream perf: TTFT, decode tok/s, cache-hit, error rate
  *   GET  /api/x99/metrics  -> proxied live vLLM Prometheus metrics (server-side panel)
+ *   GET  /api/x99/hardware -> GPU probe via ssh nvidia-smi (5s TTL cache)
+ *   GET  /api/stream?days=N&minutes=M -> SSE live push (2s snapshots: stats+perf+x99+hw)
  *   GET  /api/bills        -> ledger rows
  *   POST /api/bills        -> {platform, day, amountCny, note?}
  */
@@ -12,8 +14,9 @@ import path from "node:path";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import type { AppConfig, RequestRecord } from "./types.ts";
-import { readRange, lastNDays, readBills, appendBill } from "./store.ts";
+import { readRange, lastNDays, readBills, appendBill, dataDir } from "./store.ts";
 import { makeProxyHandler } from "./proxy.ts";
+import { liveView, startLiveTracker } from "./live.ts";
 import { loadPrices } from "./prices.ts";
 import { nowDay } from "./types.ts";
 
@@ -34,6 +37,9 @@ interface DayAgg extends Counts {
 
 export function makeRequestHandler(cfg: AppConfig) {
 	const proxy = makeProxyHandler(cfg);
+	startHwRecorder(cfg);
+	startPerfRecorder(cfg);
+	startLiveTracker(cfg.upstreams.x99?.metricsUrl); // 1Hz prefix-cache sampler for /api/live (no-op without metricsUrl)
 
 	return async function handler(req: Request): Promise<Response> {
 		const url = new URL(req.url);
@@ -51,6 +57,10 @@ export function makeRequestHandler(cfg: AppConfig) {
 			const since = Date.now() - minutes * 60000;
 			const recs = readRange(lastNDays(2)).filter((r) => r.ts >= since);
 			return Response.json(buildPerf(recs, minutes));
+		}
+
+		if (p === "/api/live") {
+			return Response.json(liveView()); // in-flight x99 chat requests: prefill progress estimates (PiTask page polls this)
 		}
 
 		if (p === "/api/x99/metrics") {
@@ -72,6 +82,60 @@ export function makeRequestHandler(cfg: AppConfig) {
 			const hw = cfg.upstreams.x99?.hardware;
 			if (!hw) return Response.json({ ok: false, reason: "upstream x99 has no hardware probe" }, { status: 404 });
 			return Response.json(await probeHardware(hw.sshHost));
+		}
+
+		if (p === "/api/hw/history") {
+			const minutes = Math.min(Math.max(parseInt(url.searchParams.get("minutes") ?? "60", 10) || 60, 1), 1440);
+			const since = Date.now() - minutes * 60000;
+			const rows: any[] = [];
+			for (const day of lastNDays(2)) {
+				let text: string;
+				try {
+					text = fs.readFileSync(hwLogFilePath(cfg, day), "utf8");
+				} catch {
+					continue;
+				}
+				for (const line of text.split("\n")) {
+					if (!line.trim()) continue;
+					try {
+						const r = JSON.parse(line);
+						if (r.ts >= since) rows.push(r);
+					} catch {
+						// torn tail write on crash — ignore partial line
+					}
+				}
+			}
+			return Response.json({ ok: true, minutes, rows });
+		}
+
+		if (p === "/api/x99/perf-history") {
+			const minutes = Math.min(Math.max(parseInt(url.searchParams.get("minutes") ?? "60", 10) || 60, 1), 1440);
+			const since = Date.now() - minutes * 60000;
+			const rows: any[] = [];
+			for (const day of lastNDays(2)) {
+				let text: string;
+				try {
+					text = fs.readFileSync(perfLogFilePath(cfg, day), "utf8");
+				} catch {
+					continue;
+				}
+				for (const line of text.split("\n")) {
+					if (!line.trim()) continue;
+					try {
+						const r = JSON.parse(line);
+						if (r.ts >= since) rows.push(r);
+					} catch {
+						// torn tail write on crash — ignore partial line
+					}
+				}
+			}
+			return Response.json({ ok: true, minutes, rows });
+		}
+
+		if (p === "/api/stream") {
+			const days = Math.min(Math.max(parseInt(url.searchParams.get("days") ?? "14", 10) || 14, 1), 90);
+			const minutes = Math.min(Math.max(parseInt(url.searchParams.get("minutes") ?? "5", 10) || 5, 1), 1440);
+			return liveStream(cfg, days, minutes);
 		}
 
 		if (p === "/api/bills" && req.method === "GET") {
@@ -284,11 +348,13 @@ export function buildPerf(records: RequestRecord[], minutes: number) {
 			a.cacheS += r.usage.cacheRead ?? 0;
 		}
 		if (r.stream && r.ttftMs != null) a.ttfts.push(r.ttftMs);
-		// decode speed needs a streaming request with usage: tokOut over the post-first-byte window
+		// decode speed needs a streaming request with usage: tokOut over the post-first-byte window.
+		// Cap at 2000 tok/s per request: engine-crash-aborted streams yield huge tokOut over a tiny
+		// window and would poison the aggregate (real single-request peak is a few hundred).
 		if (r.stream && r.ttftMs != null && r.usage?.tokOut) {
 			const decodeS = (r.latencyMs - r.ttftMs) / 1000;
-			if (decodeS > 0.05) {
-				const out = r.usage.tokOut ?? 0;
+			const out = r.usage.tokOut ?? 0;
+			if (decodeS > 0.05 && out / decodeS < 2000) {
 				a.tpss.push(out / decodeS);
 				a.decodeS += decodeS;
 				a.tpsTokOutS += out;
@@ -379,9 +445,10 @@ export function parseVllmMetrics(text: string) {
 	// as labels of the info metric. usage = 1 - free/(num_gpu_blocks-1).
 	const cfg = series.get("vllm:cache_config_info")?.[0]?.labels ?? {};
 	const numGpuBlocks = cfg.num_gpu_blocks && cfg.num_gpu_blocks !== "None" ? parseInt(cfg.num_gpu_blocks, 10) : null;
-	const blockSize = cfg.block_size ? parseInt(cfg.block_size, 10) : null;
 	const kvCacheSizeTokens = cfg.kv_cache_size_tokens ? parseInt(cfg.kv_cache_size_tokens, 10) : null;
-	const kvInUseTokens = numGpuBlocks ? Math.round((numGpuBlocks - 1) * kvMax / 100 * (blockSize ?? 16)) : null;
+	// hybrid-architecture engines expose a block_size label that is NOT "tokens per block"
+	// (e.g. 1648 vs true pool 718,636 tokens / 477 blocks), so derive used tokens from the real pool size.
+	const kvInUseTokens = kvCacheSizeTokens != null && kvMax != null ? Math.round(kvCacheSizeTokens * kvMax / 100) : null;
 
 	const cacheHits = sum("vllm:prefix_cache_hits_total");
 	const cacheQueries = sum("vllm:prefix_cache_queries_total");
@@ -390,6 +457,7 @@ export function parseVllmMetrics(text: string) {
 	const specDrafts = sum("vllm:spec_decode_num_drafts_total");
 	const genTokens = sum("vllm:generation_tokens_total");
 	const promptCacheHit = sum("vllm:prompt_tokens_by_source_total", (l) => l.source === "local_cache_hit");
+	const promptCompute = sum("vllm:prompt_tokens_by_source_total", (l) => l.source === "local_compute");
 	const promptTotal = sum("vllm:prompt_tokens_total");
 
 	return {
@@ -425,10 +493,54 @@ export function parseVllmMetrics(text: string) {
 			return c > 0 ? Math.round((s / c) * 100) / 100 : null;
 		})(),
 		promptTokensTotal: promptTotal,
+		promptComputeTokens: promptCompute,
 		generationTokensTotal: genTokens,
 		preemptionsTotal: sum("vllm:num_preemptions_total"),
 		successTotal: sum("vllm:request_success_total"),
 		generatedAt: new Date().toISOString(),
+	};
+}
+
+// ── x99 实时窗口吞吐（近 6s 整体速率，计数器差分，非累计均值）─────────────
+// vLLM 的 Prometheus 只有进程启动起的累计计数器，无窗口口径；这里在 collector
+// 的 2s 节拍上自己记一条 ring（窗口 3 个采样点，~300 token/窗口），差分出「当前这一刻」的吞吐。
+// 空闲即回落，vLLM 重启（计数器归零）时自动清 ring 重新预热 6s。
+const X99_WINDOW_MS = 6_000;
+interface X99Sample {
+	ts: number;
+	gen: number;
+	prompt: number;
+	compute: number;
+}
+const x99Ring: X99Sample[] = [];
+
+function trackX99Window(d: any): void {
+	if (d.online !== true) return;
+	const ts = Date.now();
+	const s: X99Sample = {
+		ts,
+		gen: d.generationTokensTotal ?? 0,
+		prompt: d.promptTokensTotal ?? 0,
+		compute: d.promptComputeTokens ?? 0,
+	};
+	const last = x99Ring[x99Ring.length - 1];
+	if (last && (s.gen < last.gen || s.prompt < last.prompt || s.compute < last.compute)) x99Ring.length = 0; // 计数器回退 = 引擎重启
+	x99Ring.push(s);
+	const cutoff = ts - X99_WINDOW_MS - 4_000; // 2s 节拍，4s 余量
+	while (x99Ring.length > 2 && x99Ring[0].ts < cutoff) x99Ring.shift();
+	// 基线 = 不晚于 now-6s 的最新样本（实际窗口 6~8s）
+	let base: X99Sample | null = null;
+	for (const x of x99Ring) if (x.ts <= ts - X99_WINDOW_MS) base = x;
+	if (!base) return; // 预热中（<6s）
+	const el = (ts - base.ts) / 1000;
+	if (ts - base.ts < X99_WINDOW_MS / 2) return;
+	const r1 = (v: number) => Math.round(v * 10) / 10;
+	d.perfWindow = {
+		seconds: X99_WINDOW_MS / 1000,
+		elapsedS: r1(el),
+		decodeTokS: r1(Math.max(0, s.gen - base.gen) / el),
+		prefillTokS: r1(Math.max(0, s.compute - base.compute) / el),
+		promptTokS: r1(Math.max(0, s.prompt - base.prompt) / el),
 	};
 }
 
@@ -451,6 +563,16 @@ for line in q.split("\\n"):
 for g in gpus:
     r=reasons.get(g["index"],{})
     g["throttleActive"]=[k for k,v in r.items() if v]
+tq = subprocess.run(["nvidia-smi","-q","-d","TEMPERATURE"],capture_output=True,text=True).stdout
+tidx=-1; tmap={}
+for line in tq.split("\\n"):
+    if re.match(r"\\s*GPU\\s+[0-9A-Fa-f:\\-.]+",line): tidx+=1
+    tm=re.match(r"\\s+(GPU Current Temp\\w*|GPU Memory Temperature|Memory Junction Temperature|GPU Slowdown Temp\\w*)\\s*:\\s*([0-9]+)",line)
+    if tm and tidx>=0: tmap.setdefault(tidx,{})[tm.group(1)]=int(tm.group(2))
+for g in gpus:
+    tt=tmap.get(g["index"],{})
+    g["memTempC"]=tt.get("GPU Memory Temperature", tt.get("Memory Junction Temperature"))
+    g["slowdownTempC"]=tt.get("GPU Slowdown Temp")
 print(json.dumps(gpus))
 `;
 
@@ -459,7 +581,7 @@ interface HardwareCache {
 	data: any;
 }
 let hwCache: HardwareCache | null = null;
-const HW_TTL_MS = 15000;
+const HW_TTL_MS = 5000;
 
 function sshProbe(sshHost: string, timeoutMs: number): Promise<any> {
 	return new Promise((resolve, reject) => {
@@ -491,15 +613,295 @@ function sshProbe(sshHost: string, timeoutMs: number): Promise<any> {
 	});
 }
 
+/** Single-flight ssh refresh; resolves with gpus, rejects on failure. */
+function refreshHardwareOnce(sshHost: string): Promise<any> {
+	const p = sshProbe(sshHost, 6000).then((gpus) => {
+		hwCache = { at: Date.now(), data: gpus };
+		return gpus;
+	});
+	hwRefreshing = p.then(() => {}, () => {});
+	return p;
+}
+
+/** Fire-and-forget refresh used by the live collector loop; keeps stale data on failure. */
+function hardwareTick(sshHost: string | undefined): void {
+	if (!sshHost) return;
+	if (hwCache && Date.now() - hwCache.at < HW_TTL_MS) return;
+	refreshHardwareOnce(sshHost).catch(() => {});
+}
+
 async function probeHardware(sshHost: string) {
 	if (hwCache && Date.now() - hwCache.at < HW_TTL_MS) {
 		return { ok: true, cached: true, gpus: hwCache.data, generatedAt: new Date(hwCache.at).toISOString() };
 	}
 	try {
-		const gpus = await sshProbe(sshHost, 6000);
-		hwCache = { at: Date.now(), data: gpus };
+		const gpus = await refreshHardwareOnce(sshHost);
 		return { ok: true, cached: false, gpus, generatedAt: new Date().toISOString() };
 	} catch (e) {
 		return { ok: false, reason: `hardware probe failed: ${String(e).slice(0, 120)}` };
 	}
+}
+
+// ── persistent hardware recorder: 15s cadence -> data/hw/YYYY-MM-DD.jsonl ──
+
+const HW_LOG_INTERVAL_MS = 15000;
+const HW_RETENTION_DAYS = 30;
+let hwRecorderTimer: ReturnType<typeof setInterval> | null = null;
+let lastHwLoggedAt = 0;
+let hwCleanupDay: string | null = null;
+
+function hwLogFilePath(cfg: AppConfig, day: string): string {
+	return path.join(dataDir(), "hw", `${day}.jsonl`);
+}
+
+/** Always-on recorder: history survives dashboard close; ssh failures leave gaps, not junk. */
+function startHwRecorder(cfg: AppConfig): void {
+	const sshHost = cfg.upstreams.x99?.hardware?.sshHost;
+	if (!sshHost || hwRecorderTimer) return;
+	recordHardwareOnce(cfg, sshHost).catch(() => {});
+	hwRecorderTimer = setInterval(() => {
+		recordHardwareOnce(cfg, sshHost).catch(() => {});
+	}, HW_LOG_INTERVAL_MS);
+	hwRecorderTimer.unref?.();
+}
+
+async function recordHardwareOnce(cfg: AppConfig, sshHost: string): Promise<void> {
+	const now = Date.now();
+	if (now - lastHwLoggedAt < HW_LOG_INTERVAL_MS - 1000) return;
+	let gpus: any;
+	try {
+		gpus = await refreshHardwareOnce(sshHost);
+	} catch {
+		return; // probe failed — skip this cadence
+	}
+	lastHwLoggedAt = Date.now();
+	const day = nowDay(new Date(now));
+	const file = hwLogFilePath(cfg, day);
+	fs.mkdirSync(path.dirname(file), { recursive: true });
+	fs.appendFileSync(file, JSON.stringify({ ts: lastHwLoggedAt, gpus }) + "\n");
+	if (hwCleanupDay !== day) {
+		hwCleanupDay = day;
+		try {
+			const cutoff = nowDay(new Date(now - HW_RETENTION_DAYS * 86400000));
+			for (const f of fs.readdirSync(path.join(dataDir(), "hw"))) {
+				const d = f.replace(/\.jsonl$/, "");
+				if (/^\d{4}-\d{2}-\d{2}$/.test(d) && d < cutoff) fs.rmSync(path.join(dataDir(), "hw", f), { force: true });
+			}
+		} catch {
+			// retention sweep is best effort
+		}
+	}
+}
+
+// ── persistent x99 throughput recorder: 6s cadence -> data/x99perf/YYYY-MM-DD.jsonl ──
+// 独立于 dashboard SSE collector（那个只在有人开页面时跑）：这个常驻采样器保证
+// 6s 吞吐历史在无人看时也持续落盘，事后可与 data/hw（15s 温度）对照。
+
+const PERF_LOG_INTERVAL_MS = 6000;
+const PERF_RETENTION_DAYS = 30;
+let perfRecorderTimer: ReturnType<typeof setInterval> | null = null;
+let perfCleanupDay: string | null = null;
+interface PerfSample {
+	ts: number;
+	gen: number;
+	prompt: number;
+	compute: number;
+	running: number;
+	ctx: number; // KV 池已用 token（瞬时 gauge，含前缀缓存留存）——「上下文长度」口径
+}
+const perfRing: PerfSample[] = [];
+
+function perfLogFilePath(cfg: AppConfig, day: string): string {
+	return path.join(dataDir(), "x99perf", `${day}.jsonl`);
+}
+
+function startPerfRecorder(cfg: AppConfig): void {
+	const metricsUrl = cfg.upstreams.x99?.metricsUrl;
+	if (!metricsUrl || perfRecorderTimer) return;
+	const tick = () => recordPerfOnce(cfg, metricsUrl).catch(() => {});
+	tick();
+	perfRecorderTimer = setInterval(tick, PERF_LOG_INTERVAL_MS);
+	perfRecorderTimer.unref?.();
+}
+
+async function recordPerfOnce(cfg: AppConfig, metricsUrl: string): Promise<void> {
+	let text: string;
+	try {
+		const ac = new AbortController();
+		const timer = setTimeout(() => ac.abort(), 3000);
+		const res = await fetch(metricsUrl, { signal: ac.signal, headers: { accept: "text/plain" } });
+		clearTimeout(timer);
+		if (!res.ok) return;
+		text = await res.text();
+	} catch {
+		return; // unreachable — skip this cadence, ring keeps the gap
+	}
+	const d = parseVllmMetrics(text);
+	if (d.online !== true) return;
+	const ts = Date.now();
+	const s: PerfSample = {
+		ts,
+		gen: d.generationTokensTotal ?? 0,
+		prompt: d.promptTokensTotal ?? 0,
+		compute: d.promptComputeTokens ?? 0,
+		running: d.numRunning ?? 0,
+		ctx: d.kvCacheUsedTokens ?? 0,
+	};
+	const last = perfRing[perfRing.length - 1];
+	if (last && (s.gen < last.gen || s.prompt < last.prompt || s.compute < last.compute)) perfRing.length = 0; // 引擎重启
+	perfRing.push(s);
+	const cutoff = ts - PERF_LOG_INTERVAL_MS * 3;
+	while (perfRing.length > 2 && perfRing[0].ts < cutoff) perfRing.shift();
+	// 基线 = 不晚于 now-6s 的最新样本（实际窗口 6~12s，随 tick 抖动）
+	let base: PerfSample | null = null;
+	for (const x of perfRing) if (x.ts <= ts - PERF_LOG_INTERVAL_MS) base = x;
+	if (!base || ts - base.ts < PERF_LOG_INTERVAL_MS / 2) return; // 预热中
+	const el = (ts - base.ts) / 1000;
+	const r1 = (v: number) => Math.round(v * 10) / 10;
+	const day = nowDay(new Date(ts));
+	const file = perfLogFilePath(cfg, day);
+	fs.mkdirSync(path.dirname(file), { recursive: true });
+	fs.appendFileSync(
+		file,
+		JSON.stringify({
+			ts,
+			decodeTokS: r1(Math.max(0, s.gen - base.gen) / el),
+			prefillTokS: r1(Math.max(0, s.compute - base.compute) / el),
+			running: s.running,
+			ctxTokens: s.ctx,
+		}) + "\n",
+	);
+	if (perfCleanupDay !== day) {
+		perfCleanupDay = day;
+		try {
+			const cutoffDay = nowDay(new Date(ts - PERF_RETENTION_DAYS * 86400000));
+			for (const f of fs.readdirSync(path.join(dataDir(), "x99perf"))) {
+				const dd = f.replace(/\.jsonl$/, "");
+				if (/^\d{4}-\d{2}-\d{2}$/.test(dd) && dd < cutoffDay) fs.rmSync(path.join(dataDir(), "x99perf", f), { force: true });
+			}
+		} catch {
+			// retention sweep is best effort
+		}
+	}
+}
+
+// ── live push: unified collector + SSE fan-out ───────────────────────────
+
+const SNAP_INTERVAL_MS = 2000;
+let hwRefreshing: Promise<void> = Promise.resolve();
+
+interface LiveSnapshotFrame {
+	ts: number;
+	x99: any;
+	hw: any;
+	stats: any;
+	perf: any;
+}
+
+interface LiveClient {
+	days: number;
+	minutes: number;
+	send: (f: LiveSnapshotFrame) => void;
+}
+
+const liveClients = new Map<string, LiveClient>();
+const lastFrameByWindow = new Map<string, LiveSnapshotFrame>();
+let collectorTimer: ReturnType<typeof setInterval> | null = null;
+let collecting = false;
+
+function ensureCollector(cfg: AppConfig): void {
+	if (collectorTimer) return;
+	collectorTimer = setInterval(() => {
+		collectOnce(cfg).catch(() => {});
+	}, SNAP_INTERVAL_MS);
+	collectorTimer.unref?.();
+}
+
+async function collectOnce(cfg: AppConfig): Promise<void> {
+	if (collecting || liveClients.size === 0) return;
+	collecting = true;
+	try {
+		const x99hw = cfg.upstreams.x99;
+		let x99: any = { ok: false, reason: "upstream x99 has no metricsUrl" };
+		if (x99hw?.metricsUrl) {
+			try {
+				const ac = new AbortController();
+				const timer = setTimeout(() => ac.abort(), 3000);
+				const res = await fetch(x99hw.metricsUrl, { signal: ac.signal, headers: { accept: "text/plain" } });
+				clearTimeout(timer);
+				x99 = res.ok ? { ok: true, data: parseVllmMetrics(await res.text()) } : { ok: false, reason: `metrics HTTP ${res.status}` };
+				if (x99.ok) trackX99Window(x99.data);
+			} catch (e) {
+				x99 = { ok: false, reason: `metrics unreachable: ${String(e).slice(0, 120)}` };
+			}
+		}
+		hardwareTick(x99hw?.hardware?.sshHost);
+		const hw = hwCache
+			? { ok: true, cached: true, gpus: hwCache.data, generatedAt: new Date(hwCache.at).toISOString() }
+			: { ok: false, reason: "hardware probe pending" };
+
+		// aggregate once per distinct window actually in use
+		const dayWins = [...new Set([...liveClients.values()].map((c) => c.days))];
+		const minWins = [...new Set([...liveClients.values()].map((c) => c.minutes))];
+		const statsByWin = new Map<number, any>();
+		for (const d of dayWins) statsByWin.set(d, buildStats(readRange(lastNDays(d)), d));
+		const perfByWin = new Map<number, any>();
+		for (const m of minWins) {
+			const since = Date.now() - m * 60000;
+			perfByWin.set(m, buildPerf(readRange(lastNDays(2)).filter((r) => r.ts >= since), m));
+		}
+
+		const ts = Date.now();
+		for (const [key, c] of liveClients) {
+			const frame: LiveSnapshotFrame = { ts, x99, hw, stats: statsByWin.get(c.days), perf: perfByWin.get(c.minutes) };
+			lastFrameByWindow.set(`${c.days}/${c.minutes}`, frame);
+			try {
+				c.send(frame);
+			} catch {
+				liveClients.delete(key);
+			}
+		}
+	} finally {
+		collecting = false;
+	}
+}
+
+function liveStream(cfg: AppConfig, days: number, minutes: number): Response {
+	const key = `${days}/${minutes}/${Math.random().toString(36).slice(2, 8)}`;
+	const enc = new TextEncoder();
+	let closed = false;
+	const stream = new ReadableStream<Uint8Array>({
+		start(controller) {
+			const client: LiveClient = {
+				days,
+				minutes,
+				send: (f) => {
+					if (closed) return;
+					controller.enqueue(enc.encode(`data: ${JSON.stringify(f)}\n\n`));
+				},
+			};
+			liveClients.set(key, client);
+			ensureCollector(cfg);
+			const warm = lastFrameByWindow.get(`${days}/${minutes}`);
+			if (warm) {
+				try {
+					controller.enqueue(enc.encode(`data: ${JSON.stringify(warm)}\n\n`));
+				} catch {
+					closed = true;
+					liveClients.delete(key);
+				}
+			}
+		},
+		cancel() {
+			closed = true;
+			liveClients.delete(key);
+		},
+	});
+	return new Response(stream, {
+		headers: {
+			"content-type": "text/event-stream",
+			"cache-control": "no-cache, no-transform",
+			"x-accel-buffering": "no",
+		},
+	});
 }

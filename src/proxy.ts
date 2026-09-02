@@ -12,6 +12,7 @@
 import type { AppConfig, UsageRecord } from "./types.ts";
 import { normalizeUsage, usageFromJsonBody, SseScanner, type SseScanResult } from "./usage.ts";
 import { append } from "./store.ts";
+import { liveRegister, liveFirstByte, liveDone } from "./live.ts";
 import { computeCost } from "./prices.ts";
 import { nowDay } from "./types.ts";
 
@@ -133,6 +134,12 @@ export function makeProxyHandler(cfg: AppConfig) {
 			}
 		}
 
+		// live progress: track forwarded chat requests on vLLM upstreams (prefix-cache admission tracking)
+		const liveId =
+			def.metricsUrl && req.method === "POST" && restPath.endsWith("/chat/completions")
+				? liveRegister(upName, tool, bodyInit ? bodyInit.byteLength : 0)
+				: 0;
+
 		// ── outbound fetch ────────────────────────────────────────────────
 		let upRes: Response;
 		try {
@@ -143,6 +150,7 @@ export function makeProxyHandler(cfg: AppConfig) {
 				redirect: "manual",
 			});
 		} catch (err) {
+			liveDone(liveId);
 			finish({
 				tool, upstream: upName, model: reqModel, restPath, method: req.method,
 				startedAt, status: 0, scan: null, injectedUsageOpt,
@@ -173,6 +181,7 @@ export function makeProxyHandler(cfg: AppConfig) {
 			const onDone = () => {
 				if (done) return;
 				done = true;
+				liveDone(liveId);
 				scanner.end();
 				finish({
 					tool, upstream: upName, model: scanner.result.model ?? reqModel, restPath,
@@ -183,7 +192,10 @@ export function makeProxyHandler(cfg: AppConfig) {
 			const meteringStream = upRes.body.pipeThrough(
 				new TransformStream<Uint8Array, Uint8Array>({
 					transform(chunk, ctrl) {
-						if (firstChunkAt == null) firstChunkAt = Date.now();
+						if (firstChunkAt == null) {
+							firstChunkAt = Date.now();
+							liveFirstByte(liveId); // first SSE frame ≈ prefill done, decode started
+						}
 						scanner.push(decoder.decode(chunk, { stream: true }));
 						ctrl.enqueue(chunk);
 					},
@@ -199,6 +211,7 @@ export function makeProxyHandler(cfg: AppConfig) {
 				.then(onDone)
 				.catch((e) => {
 					done = true;
+					liveDone(liveId);
 					finish({
 						tool, upstream: upName, model: scanner.result.model ?? reqModel, restPath,
 						method: req.method, startedAt, status: upRes.status,
@@ -210,6 +223,7 @@ export function makeProxyHandler(cfg: AppConfig) {
 		}
 
 		// ── buffered path (JSON / text / everything else) ────────────────
+		if (liveId) liveFirstByte(liveId); // headers received ≈ upstream finished the request
 		const text = await upRes.text();
 		let usage: UsageRecord | null = null;
 		let respModel: string | null = null;
@@ -224,6 +238,7 @@ export function makeProxyHandler(cfg: AppConfig) {
 			scan: usage ? { usage, model: respModel, sawDone: false, frames: 1 } : null,
 			injectedUsageOpt, stream: false, ttftMs: null,
 		});
+			liveDone(liveId);
 		return new Response(text, { status: upRes.status, headers: resHeaders });
 	};
 }
